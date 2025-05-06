@@ -1,0 +1,101 @@
+blueprint:
+  name: Camera Bird Detection with AI & Notification
+  description: >
+    When motion is detected, capture snapshots from a camera, analyze them with Google Generative AI to detect birds,
+    and send a notification if a bird is found.
+  domain: automation
+  input:
+    motion_sensor:
+      name: Motion Sensor
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: motion
+    camera:
+      name: Camera
+      selector:
+        entity:
+          domain: camera
+    device_notification_target:
+      name: Mobile Device
+      description: Device to receive notifications
+      selector:
+        device:
+          integration: mobile_app
+    is_ios:
+      name: Is iOS Device?
+      description: Set to true if the target device is running iOS.
+      default: false
+      selector:
+        boolean:
+    snapshot_count:
+      name: Number of Snapshots
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 5
+          mode: slider
+
+trigger:
+  - platform: state
+    entity_id: !input motion_sensor
+    to: "on"
+
+variables:
+  camera_device: !input camera
+  camera_name: "{{ state_attr(camera_device, 'friendly_name') }}"
+  camera_path: "{{ state_attr(camera_device, 'friendly_name') | lower | replace(' ', '_') }}"
+  motion_sensor: !input motion_sensor
+  motion_name: "{{ state_attr(motion_sensor, 'friendly_name') }}"
+  is_ios: !input is_ios
+  num_snapshots: !input snapshot_count
+  snapshot_access_file_path: "/local/snapshots/{{ camera_path }}_snapshot1.jpg"
+  ai_prompt: >
+    Motion has been detected. Please look at the following sequence of images from my {{ camera_name }} camera and tell me if there is a bird in any of them.
+    If yes, describe the bird briefly (such as size, color, position). If there is no bird, reply with "No bird detected."
+    Keep your message short and suitable for a phone notification.
+
+mode: single
+
+action:
+  - repeat:
+      count: "{{ num_snapshots }}"
+      sequence:
+        - service: camera.snapshot
+          data:
+            filename: >-
+              /config/www/snapshots/{{ camera_path }}_snapshot{{ repeat.index }}.jpg
+          target:
+            entity_id: "{{ camera_device }}"
+        - delay:
+            milliseconds: 500
+
+  - service: google_generative_ai_conversation.generate_content
+    data:
+      prompt: "{{ ai_prompt }}"
+      filenames: >
+        {% set ns = namespace(images=[]) %}
+        {% for i in range(1, num_snapshots + 1) %}
+          {% set image = "/config/www/snapshots/" ~ camera_path ~ "_snapshot" ~ i ~ ".jpg" %}
+          {% set ns.images = ns.images + [image] %}
+        {% endfor %}
+        {{ ns.images | tojson }}
+    response_variable: generated_content
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ generated_content.get('text', '') != 'No bird detected.' }}
+        sequence:
+          - service: notify.send_message
+            data:
+              message: "{{ generated_content['text'] }}"
+              title: "{{ motion_name }} - Bird Detected"
+              data: >
+                {% set android_data = {"image": snapshot_access_file_path} %}
+                {% set ios_data = {"attachment": {"url": snapshot_access_file_path, "content_type": "JPEG"}} %}
+                {{ ios_data if is_ios else android_data }}
+            target:
+              device_id: !input device_notification_target
